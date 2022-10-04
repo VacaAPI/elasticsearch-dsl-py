@@ -18,22 +18,10 @@
 from datetime import datetime, timedelta
 
 from .aggs import A
-from .query import MatchAll, Nested, Range, Terms
-from .response import Response
-from .search import Search
-from .utils import AttrDict
-
-__all__ = [
-    "FacetedSearch",
-    "HistogramFacet",
-    "TermsFacet",
-    "DateHistogramFacet",
-    "RangeFacet",
-    "NestedFacet",
-]
+from .query import Nested, Range, Terms
 
 
-class Facet:
+class Facet(object):
     """
     A facet on faceted search. Wraps and aggregation and provides functionality
     to create a filter for selected values and return a list of facet values
@@ -115,7 +103,7 @@ class TermsFacet(Facet):
     agg_type = "terms"
 
     def add_filter(self, filter_values):
-        """Create a terms filter instead of bool containing term filters."""
+        """ Create a terms filter instead of bool containing term filters.  """
         if filter_values:
             return Terms(
                 _expand__to_dot=False, **{self._params["field"]: filter_values}
@@ -135,7 +123,7 @@ class RangeFacet(Facet):
         return out
 
     def __init__(self, ranges, **kwargs):
-        super().__init__(**kwargs)
+        super(RangeFacet, self).__init__(**kwargs)
         self._params["ranges"] = list(map(self._range_to_dict, ranges))
         self._params["keyed"] = False
         self._ranges = dict(ranges)
@@ -162,14 +150,8 @@ class HistogramFacet(Facet):
                     "gte": filter_value,
                     "lt": filter_value + self._params["interval"],
                 }
-            },
+            }
         )
-
-
-def _date_interval_year(d):
-    return d.replace(
-        year=d.year + 1, day=(28 if d.month == 2 and d.day == 29 else d.day)
-    )
 
 
 def _date_interval_month(d):
@@ -192,8 +174,6 @@ class DateHistogramFacet(Facet):
     agg_type = "date_histogram"
 
     DATE_INTERVALS = {
-        "year": _date_interval_year,
-        "1Y": _date_interval_year,
         "month": _date_interval_month,
         "1M": _date_interval_month,
         "week": _date_interval_week,
@@ -206,7 +186,7 @@ class DateHistogramFacet(Facet):
 
     def __init__(self, **kwargs):
         kwargs.setdefault("min_doc_count", 0)
-        super().__init__(**kwargs)
+        super(DateHistogramFacet, self).__init__(**kwargs)
 
     def get_value(self, bucket):
         if not isinstance(bucket["key"], datetime):
@@ -235,7 +215,7 @@ class DateHistogramFacet(Facet):
                         filter_value
                     ),
                 }
-            },
+            }
         )
 
 
@@ -245,7 +225,9 @@ class NestedFacet(Facet):
     def __init__(self, path, nested_facet):
         self._path = path
         self._inner = nested_facet
-        super().__init__(path=path, aggs={"inner": nested_facet.get_aggregation()})
+        super(NestedFacet, self).__init__(
+            path=path, aggs={"inner": nested_facet.get_aggregation()}
+        )
 
     def get_values(self, data, filter_values):
         return self._inner.get_values(data.inner, filter_values)
@@ -256,203 +238,22 @@ class NestedFacet(Facet):
             return Nested(path=self._path, query=inner_q)
 
 
-class FacetedResponse(Response):
-    @property
-    def query_string(self):
-        return self._faceted_search._query
+from ._base.faceted_search import FacetedResponse
+from ._sync.faceted_search import FacetedSearch
 
-    @property
-    def facets(self):
-        if not hasattr(self, "_facets"):
-            super(AttrDict, self).__setattr__("_facets", AttrDict({}))
-            for name, facet in self._faceted_search.facets.items():
-                self._facets[name] = facet.get_values(
-                    getattr(getattr(self.aggregations, "_filter_" + name), name),
-                    self._faceted_search.filter_values.get(name, ()),
-                )
-        return self._facets
+__all__ = [
+    "FacetedSearch",
+    "FacetedResponse",
+    "HistogramFacet",
+    "TermsFacet",
+    "DateHistogramFacet",
+    "RangeFacet",
+    "NestedFacet",
+]
 
+try:
+    from ._async.faceted_search import AsyncFacetedSearch  # noqa: F401
 
-class FacetedSearch:
-    """
-    Abstraction for creating faceted navigation searches that takes care of
-    composing the queries, aggregations and filters as needed as well as
-    presenting the results in an easy-to-consume fashion::
-
-        class BlogSearch(FacetedSearch):
-            index = 'blogs'
-            doc_types = [Blog, Post]
-            fields = ['title^5', 'category', 'description', 'body']
-
-            facets = {
-                'type': TermsFacet(field='_type'),
-                'category': TermsFacet(field='category'),
-                'weekly_posts': DateHistogramFacet(field='published_from', interval='week')
-            }
-
-            def search(self):
-                ' Override search to add your own filters '
-                s = super(BlogSearch, self).search()
-                return s.filter('term', published=True)
-
-        # when using:
-        blog_search = BlogSearch("web framework", filters={"category": "python"})
-
-        # supports pagination
-        blog_search[10:20]
-
-        response = blog_search.execute()
-
-        # easy access to aggregation results:
-        for category, hit_count, is_selected in response.facets.category:
-            print(
-                "Category %s has %d hits%s." % (
-                    category,
-                    hit_count,
-                    ' and is chosen' if is_selected else ''
-                )
-            )
-
-    """
-
-    index = None
-    doc_types = None
-    fields = None
-    facets = {}
-    using = "default"
-
-    def __init__(self, query=None, filters={}, sort=()):
-        """
-        :arg query: the text to search for
-        :arg filters: facet values to filter
-        :arg sort: sort information to be passed to :class:`~elasticsearch_dsl.Search`
-        """
-        self._query = query
-        self._filters = {}
-        self._sort = sort
-        self.filter_values = {}
-        for name, value in filters.items():
-            self.add_filter(name, value)
-
-        self._s = self.build_search()
-
-    def count(self):
-        return self._s.count()
-
-    def __getitem__(self, k):
-        self._s = self._s[k]
-        return self
-
-    def __iter__(self):
-        return iter(self._s)
-
-    def add_filter(self, name, filter_values):
-        """
-        Add a filter for a facet.
-        """
-        # normalize the value into a list
-        if not isinstance(filter_values, (tuple, list)):
-            if filter_values is None:
-                return
-            filter_values = [
-                filter_values,
-            ]
-
-        # remember the filter values for use in FacetedResponse
-        self.filter_values[name] = filter_values
-
-        # get the filter from the facet
-        f = self.facets[name].add_filter(filter_values)
-        if f is None:
-            return
-
-        self._filters[name] = f
-
-    def search(self):
-        """
-        Returns the base Search object to which the facets are added.
-
-        You can customize the query by overriding this method and returning a
-        modified search object.
-        """
-        s = Search(doc_type=self.doc_types, index=self.index, using=self.using)
-        return s.response_class(FacetedResponse)
-
-    def query(self, search, query):
-        """
-        Add query part to ``search``.
-
-        Override this if you wish to customize the query used.
-        """
-        if query:
-            if self.fields:
-                return search.query("multi_match", fields=self.fields, query=query)
-            else:
-                return search.query("multi_match", query=query)
-        return search
-
-    def aggregate(self, search):
-        """
-        Add aggregations representing the facets selected, including potential
-        filters.
-        """
-        for f, facet in self.facets.items():
-            agg = facet.get_aggregation()
-            agg_filter = MatchAll()
-            for field, filter in self._filters.items():
-                if f == field:
-                    continue
-                agg_filter &= filter
-            search.aggs.bucket("_filter_" + f, "filter", filter=agg_filter).bucket(
-                f, agg
-            )
-
-    def filter(self, search):
-        """
-        Add a ``post_filter`` to the search request narrowing the results based
-        on the facet filters.
-        """
-        if not self._filters:
-            return search
-
-        post_filter = MatchAll()
-        for f in self._filters.values():
-            post_filter &= f
-        return search.post_filter(post_filter)
-
-    def highlight(self, search):
-        """
-        Add highlighting for all the fields
-        """
-        return search.highlight(
-            *(f if "^" not in f else f.split("^", 1)[0] for f in self.fields)
-        )
-
-    def sort(self, search):
-        """
-        Add sorting information to the request.
-        """
-        if self._sort:
-            search = search.sort(*self._sort)
-        return search
-
-    def build_search(self):
-        """
-        Construct the ``Search`` object.
-        """
-        s = self.search()
-        s = self.query(s, self._query)
-        s = self.filter(s)
-        if self.fields:
-            s = self.highlight(s)
-        s = self.sort(s)
-        self.aggregate(s)
-        return s
-
-    def execute(self):
-        """
-        Execute the search and return the response.
-        """
-        r = self._s.execute()
-        r._faceted_search = self
-        return r
+    __all__.append("AsyncFacetedSearch")
+except (ImportError, SyntaxError):
+    pass

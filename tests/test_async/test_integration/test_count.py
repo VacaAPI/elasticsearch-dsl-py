@@ -15,18 +15,28 @@
 #  specific language governing permissions and limitations
 #  under the License.
 
-from ._sync.index import Index, IndexTemplate
+from elasticsearch_dsl.search import Q, AsyncSearch
 
-__all__ = ["Index", "IndexTemplate"]
 
-try:
-    from ._async.index import AsyncIndex, AsyncIndexTemplate  # noqa: F401
+async def test_count_all(data_client):
+    s = AsyncSearch(using=data_client).index("git")
+    assert 53 == await s.count()
 
-    __all__.extend(
-        [
-            "AsyncIndex",
-            "AsyncIndexTemplate",
-        ]
-    )
-except (ImportError, SyntaxError):
-    pass
+
+async def test_count_prefetch(data_client, mocker):
+    mocker.spy(data_client, "count")
+
+    search = AsyncSearch(using=data_client).index("git")
+    await search.execute()
+    assert await search.count() == 53
+    assert data_client.count.call_count == 0
+
+    search._response.hits.total.relation = "gte"
+    assert await search.count() == 53
+    assert data_client.count.call_count == 1
+
+
+async def test_count_filter(data_client):
+    s = AsyncSearch(using=data_client).index("git").filter(~Q("exists", field="parent_shas"))
+    # initial commit + repo document
+    assert 2 == await s.count()
